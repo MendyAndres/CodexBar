@@ -44,6 +44,7 @@ struct DashboardProviderPayload: Encodable {
     let credits: DashboardCreditsPayload?
     let cost: DashboardCostPayload?
     let display: DashboardDisplayPayload
+    let actions: DashboardProviderActionsPayload?
     let error: ProviderErrorPayload?
     let updatedAt: Date?
 
@@ -58,6 +59,7 @@ struct DashboardProviderPayload: Encodable {
         case credits
         case cost
         case display
+        case actions
         case error
         case updatedAt
     }
@@ -74,9 +76,14 @@ struct DashboardProviderPayload: Encodable {
         try container.encode(self.credits, forKey: .credits)
         try container.encode(self.cost, forKey: .cost)
         try container.encode(self.display, forKey: .display)
+        try container.encodeIfPresent(self.actions, forKey: .actions)
         try container.encode(self.error, forKey: .error)
         try container.encode(self.updatedAt, forKey: .updatedAt)
     }
+}
+
+struct DashboardProviderActionsPayload: Encodable, Equatable {
+    let dashboardURL: String
 }
 
 struct DashboardStatusPayload: Encodable {

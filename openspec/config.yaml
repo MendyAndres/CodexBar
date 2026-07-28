@@ -1,0 +1,88 @@
+schema: spec-driven
+project: codexbar
+artifact_store: hybrid
+strict_tdd: true
+
+context: |
+  Tech stack: Swift 6.2/6.3 with Swift Package Manager; SwiftUI and AppKit on macOS, Foundation-based core and CLI on Linux.
+  Architecture: shared CodexBarCore domain/provider descriptors, app-side provider implementations, macOS menu-bar UI, CLI, widget, probes, and replay tools.
+  State: Observation-based @Observable models owned by SwiftUI @State; provider identity and plan data remain siloed by provider.
+  Testing: Swift Testing and XCTest through a sharded SwiftPM runner, with macOS and Linux suites plus guarded live tests.
+  Quality: SwiftFormat, SwiftLint strict mode, Swift compiler strict concurrency checks, shell/localization/documentation validation.
+  Safety: default to parser tests, fixtures, stubs, test stores, and no-UI Keychain queries; never run live account/browser probes without explicit approval.
+
+testing:
+  detected: 2026-07-24
+  strict_tdd: true
+  runner:
+    command: make test
+    implementation: ./Scripts/test.sh
+    frameworks:
+      - Swift Testing
+      - XCTest
+  layers:
+    unit:
+      available: true
+      tool: Swift Testing and XCTest
+    integration:
+      available: true
+      tool: SwiftPM suites with fixtures, stubs, test stores, CLI/router tests, and script checks
+    e2e:
+      available: true
+      tool: Opt-in live account and macOS bundle/VM validation
+      restricted: true
+  coverage:
+    available: false
+    command: null
+  quality:
+    linter:
+      available: true
+      command: make check
+    type_checker:
+      available: true
+      command: swift build
+    formatter:
+      available: true
+      command: make format
+  focused_test_command: swift test --filter <suite-or-test>
+  safety:
+    - Do not run live provider probes, browser-cookie imports, real account usage commands, or real Keychain reads without explicit approval.
+    - Keep CODEXBAR_SUPPRESS_TEST_KEYCHAIN_ACCESS enabled unless an isolated Keychain test was explicitly requested.
+    - Prefer stable model/state seams over live AppKit status-bar and menu construction.
+
+workflow:
+  execution_mode: interactive
+  chained_pr_strategy: ask-always
+  review_budget_lines: 800
+
+rules:
+  proposal:
+    - State scope, non-goals, risks, and rollback strategy.
+    - Do not assume Linux-version implementation is in scope unless explicitly requested.
+  specs:
+    - Use Given/When/Then scenarios and RFC 2119 requirement keywords.
+    - Specify privacy, provider data isolation, and prompt-safety constraints where relevant.
+  design:
+    - Reuse CodexBarCore provider descriptors and app-side ProviderImplementation seams.
+    - Prefer modern macOS Observation APIs and macOS 15+ APIs when refactoring.
+    - Document concurrency ownership and required-versus-best-effort async work.
+  tasks:
+    - Group tasks into reviewable work units and keep tests with implementation.
+    - Ask before chained PRs and target no more than 800 changed lines per review slice.
+  apply:
+    guidelines:
+      - Keep changes small and follow existing provider, state, and menu model seams.
+      - Never expose unreleased model names.
+      - Do not execute live probes, browser-cookie imports, or prompt-producing Keychain validation.
+    tdd: true
+    test_command: make test
+    quality_command: make check
+  verify:
+    test_command: make test
+    build_command: swift build
+    quality_command: make check
+    coverage_threshold: 0
+    require_focused_tests_for_provider_changes: true
+  archive:
+    - Warn before merging destructive or behavior-removing deltas.
+    - Preserve archived change directories as immutable audit history.
