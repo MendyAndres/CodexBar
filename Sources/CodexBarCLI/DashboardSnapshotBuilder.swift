@@ -73,12 +73,24 @@ enum DashboardSnapshotBuilder {
                 accentColor: self.hexColor(descriptor?.branding.color),
                 sortKey: sortKey,
                 priority: "normal"),
+            actions: provider.flatMap(self.dashboardActions),
             error: error,
             updatedAt: self.updatedAt(
                 payload: payload,
                 cost: cost,
                 error: error,
                 generatedAt: generatedAt))
+    }
+
+    static func dashboardActions(for provider: UsageProvider) -> DashboardProviderActionsPayload? {
+        guard let rawURL = ProviderDescriptorRegistry.descriptor(for: provider).metadata.dashboardURL,
+              let components = URLComponents(string: rawURL),
+              components.scheme?.lowercased() == "https",
+              components.host?.isEmpty == false
+        else {
+            return nil
+        }
+        return DashboardProviderActionsPayload(dashboardURL: rawURL)
     }
 
     private static func dashboardSource(from source: String) -> String {

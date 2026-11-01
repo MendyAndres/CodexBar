@@ -2,6 +2,40 @@ import CodexBarCore
 import Commander
 import Foundation
 
+enum CLIServeInheritedTokenError: Error, Equatable {
+    case empty
+    case tooLarge
+}
+
+enum CLIServeInheritedToken {
+    static func read(from handle: FileHandle, maximumBytes: Int = 4096) throws -> String {
+        var data = Data()
+        while data.count <= maximumBytes {
+            guard let byte = try handle.read(upToCount: 1), !byte.isEmpty else { break }
+            if byte.first == 0x0A { break }
+            data.append(byte)
+        }
+        return try self.read(data, maximumBytes: maximumBytes)
+    }
+
+    static func read(_ data: Data, maximumBytes: Int = 4096) throws -> String {
+        guard data.count <= maximumBytes else { throw CLIServeInheritedTokenError.tooLarge }
+        let token = (String(data: data, encoding: .utf8) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { throw CLIServeInheritedTokenError.empty }
+        return token
+    }
+}
+
+struct CLIServeReadiness: Encodable {
+    let instanceID: String
+    let port: UInt16
+
+    var encoded: String {
+        (try? JSONEncoder().encode(self)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    }
+}
+
 struct ServeOptions: CommanderParsable {
     @Flag(names: [.short("v"), .long("verbose")], help: "Enable verbose logging")
     var verbose: Bool = false
@@ -31,6 +65,12 @@ struct ServeOptions: CommanderParsable {
         help: "Bearer token for /dashboard/v1/snapshot (prefer CODEXBAR_DASHBOARD_TOKEN)")
     var dashboardBearer: String?
 
+    @Option(name: .long("dashboard-token-fd"), help: "Inherited read descriptor for the desktop dashboard token")
+    var dashboardTokenFD: String?
+
+    @Option(name: .long("dashboard-instance-id"), help: "Desktop supervisor instance ID for readiness matching")
+    var dashboardInstanceID: String?
+
     @Flag(
         name: .long("allow-plain-http"),
         help: "Accept sending the dashboard token over cleartext HTTP on a non-loopback host")
@@ -41,12 +81,42 @@ enum CLIServeRoute: Equatable {
     case health
     case usage(provider: String?)
     case cost(provider: String?)
-    case dashboardSnapshot
+    case dashboardSnapshot(CLIServeDashboardRequest)
 }
 
 enum CLIServeRouteError: Error, Equatable {
     case methodNotAllowed
     case notFound
+    case invalidDashboardRequest(CLIServeDashboardRequestError)
+}
+
+enum CLIServeDashboardRequestError: Error, Equatable {
+    case credentialInQuery(String)
+    case invalidRefresh(String)
+}
+
+struct CLIServeDashboardRequest: Equatable, Sendable {
+    let provider: String?
+    let forceRefresh: Bool
+
+    init(queryItems: [String: String]) throws {
+        let forbiddenCredentialNames = Set(["token", "access_token", "dashboard-token", "dashboard_token"])
+        if let credentialName = queryItems.keys.first(where: { forbiddenCredentialNames.contains($0.lowercased()) }) {
+            throw CLIServeDashboardRequestError.credentialInQuery(credentialName)
+        }
+
+        let provider = queryItems["provider"]?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.provider = provider?.isEmpty == false ? provider : nil
+        guard let refresh = queryItems["refresh"] else {
+            self.forceRefresh = false
+            return
+        }
+        switch refresh {
+        case "0": self.forceRefresh = false
+        case "1": self.forceRefresh = true
+        default: throw CLIServeDashboardRequestError.invalidRefresh(refresh)
+        }
+    }
 }
 
 enum CLIServeRouter {
@@ -66,7 +136,11 @@ enum CLIServeRouter {
         case "/cost":
             return .cost(provider: normalizedProvider)
         case "/dashboard/v1/snapshot":
-            return .dashboardSnapshot
+            do {
+                return try .dashboardSnapshot(CLIServeDashboardRequest(queryItems: queryItems))
+            } catch let error as CLIServeDashboardRequestError {
+                throw CLIServeRouteError.invalidDashboardRequest(error)
+            }
         default:
             throw CLIServeRouteError.notFound
         }
@@ -141,6 +215,7 @@ private struct ServeResponseRequest: Sendable {
     let configFingerprint: String
     let refreshInterval: TimeInterval
     let deadline: ContinuousClock.Instant?
+    let forceRefresh: Bool
 }
 
 struct CLIServeCoordinatedResponse: Sendable {
@@ -181,6 +256,8 @@ private struct ServeDashboardContext: Sendable {
     let usage: ServeUsageContext
     let costCollection: ServeCostCollectionContext
     let codexBarVersion: String?
+    let provider: String?
+    let forceRefresh: Bool
 }
 
 private struct ServeCostContext: Sendable {
@@ -561,6 +638,26 @@ private enum CLIServeArgumentError: LocalizedError {
     }
 }
 
+enum CLIServeDesktopManagedError: LocalizedError, Equatable {
+    case incompleteConfiguration
+    case invalidTokenFD
+    case legacyTokenTransport
+
+    var errorDescription: String? {
+        switch self {
+        case .incompleteConfiguration:
+            "desktop-managed serve requires both --dashboard-token-fd and --dashboard-instance-id"
+        case .invalidTokenFD: "--dashboard-token-fd must be a non-negative file descriptor"
+        case .legacyTokenTransport: "desktop-managed serve rejects dashboard tokens from argv and environment"
+        }
+    }
+}
+
+struct CLIServeDesktopManagedConfiguration: Equatable {
+    let tokenFD: Int32
+    let instanceID: String
+}
+
 private struct CLIServeProviderTimeoutError: LocalizedError {
     let provider: UsageProvider
 
@@ -579,6 +676,11 @@ private struct CLIServeCostTimeoutError: LocalizedError {
 
 extension CodexBarCLI {
     static let defaultServeRequestTimeout: TimeInterval = 30
+
+    static func dashboardCostRefreshFlag(forceRefresh: Bool) -> Bool {
+        forceRefresh
+    }
+
     static let serveCostRefreshesPricingInBackground = true
     private static let maximumServeRequestTimeout: TimeInterval = 86400
 
@@ -596,9 +698,13 @@ extension CodexBarCLI {
         let host = Self.decodeServeHost(from: values)
         let refreshInterval = Self.decodeServeRefreshInterval(from: values)
         let requestTimeout = Self.decodeServeRequestTimeout(from: values)
-        let tokenResolution = Self.resolveDashboardToken(
-            from: values,
-            environment: ProcessInfo.processInfo.environment)
+        let environment = ProcessInfo.processInfo.environment
+        let desktopManaged: CLIServeDesktopManagedConfiguration?
+        do {
+            desktopManaged = try Self.desktopManagedDashboardConfiguration(values: values, environment: environment)
+        } catch {
+            Self.exit(code: .failure, message: error.localizedDescription, output: output, kind: .args)
+        }
 
         guard let port else {
             Self.exit(
@@ -633,7 +739,14 @@ extension CodexBarCLI {
         }
 
         let dashboardBearer: String?
-        switch tokenResolution {
+        if let desktopManaged {
+            let handle = FileHandle(fileDescriptor: desktopManaged.tokenFD, closeOnDealloc: true)
+            do {
+                dashboardBearer = try CLIServeInheritedToken.read(from: handle)
+            } catch {
+                Self.exit(code: .failure, message: "invalid inherited dashboard token", output: output, kind: .args)
+            }
+        } else { switch Self.resolveDashboardToken(from: values, environment: environment) {
         case .absent:
             dashboardBearer = nil
         case let .token(bearer):
@@ -644,7 +757,7 @@ extension CodexBarCLI {
                 message: CLIServeArgumentError.emptyDashboardToken(source: source).localizedDescription,
                 output: output,
                 kind: .args)
-        }
+        } }
 
         let bindHost = CLIServeSecurity.bindHost(host)
         let allowPlainHTTP = Self.decodeServeAllowPlainHTTP(from: values)
@@ -689,7 +802,13 @@ extension CodexBarCLI {
 
         do {
             try await server.run {
-                Self.writeStderr("CodexBar server listening on http://\(bindHost):\(port)\n")
+                if let desktopManaged, let boundPort = server.listeningPort {
+                    Self
+                        .writeStderr(CLIServeReadiness(instanceID: desktopManaged.instanceID, port: boundPort)
+                            .encoded + "\n")
+                } else {
+                    Self.writeStderr("CodexBar server listening on http://\(bindHost):\(port)\n")
+                }
                 if !CLIServeSecurity.isLoopbackHost(bindHost) {
                     Self.writeStderr(
                         "Warning: plain HTTP on a non-loopback host; the bearer token gating "
@@ -713,6 +832,30 @@ extension CodexBarCLI {
     }
 
     static let dashboardTokenEnvironmentVariable = "CODEXBAR_DASHBOARD_TOKEN"
+
+    static func desktopManagedDashboardConfiguration(
+        values: ParsedValues,
+        environment: [String: String]) throws -> CLIServeDesktopManagedConfiguration?
+    {
+        let rawFD = values.options["dashboardTokenFD"]?.last
+        let rawInstanceID = values.options["dashboardInstanceID"]?.last
+        guard rawFD != nil || rawInstanceID != nil else { return nil }
+        guard let rawFD, let fd = Int32(rawFD), fd >= 0,
+              let instanceID = rawInstanceID?.trimmingCharacters(in: .whitespacesAndNewlines), !instanceID.isEmpty
+        else { throw CLIServeDesktopManagedError.incompleteConfiguration }
+        guard values.options["dashboardBearer"]?.isEmpty != false,
+              environment[Self.dashboardTokenEnvironmentVariable] == nil
+        else { throw CLIServeDesktopManagedError.legacyTokenTransport }
+        return CLIServeDesktopManagedConfiguration(tokenFD: fd, instanceID: instanceID)
+    }
+
+    static func legacyDashboardTokenTransportRejected(
+        values: ParsedValues,
+        environment: [String: String]) -> Bool
+    {
+        values.options["dashboardBearer"]?
+            .isEmpty == false || environment[self.dashboardTokenEnvironmentVariable] != nil
+    }
 
     enum CLIServeDashboardTokenResolution: Equatable {
         case absent
@@ -762,7 +905,7 @@ extension CodexBarCLI {
         } else {
             parsed = 8080
         }
-        guard parsed > 0, parsed <= Int(UInt16.max) else { return nil }
+        guard parsed >= 0, parsed <= Int(UInt16.max) else { return nil }
         return UInt16(parsed)
     }
 
@@ -813,6 +956,8 @@ extension CodexBarCLI {
         } catch CLIServeRouteError.methodNotAllowed {
             let response = Self.serveError(status: .methodNotAllowed, message: "method not allowed")
             return request.path.hasPrefix("/dashboard/v1/") ? Self.addingNoStore(response) : response
+        } catch CLIServeRouteError.invalidDashboardRequest {
+            return Self.addingNoStore(Self.serveError(status: .badRequest, message: "invalid dashboard request"))
         } catch {
             let response = Self.serveError(status: .notFound, message: "not found")
             return request.path.hasPrefix("/dashboard/v1/") ? Self.addingNoStore(response) : response
@@ -842,7 +987,8 @@ extension CodexBarCLI {
                     key: operationKey,
                     configFingerprint: snapshot.cacheToken,
                     refreshInterval: runtime.refreshInterval,
-                    deadline: requestDeadline),
+                    deadline: requestDeadline,
+                    forceRefresh: false),
                 cache: runtime.cache,
                 makeResponse: {
                     await Self.serveUsage(
@@ -873,7 +1019,8 @@ extension CodexBarCLI {
                     key: operationKey,
                     configFingerprint: snapshot.cacheToken,
                     refreshInterval: runtime.refreshInterval,
-                    deadline: requestDeadline),
+                    deadline: requestDeadline,
+                    forceRefresh: false),
                 cache: runtime.cache,
                 makeResponse: {
                     await Self.serveCost(
@@ -887,7 +1034,7 @@ extension CodexBarCLI {
                                 now: { ContinuousClock().now },
                                 providerOperations: runtime.costOperations)))
                 }))
-        case .dashboardSnapshot:
+        case let .dashboardSnapshot(dashboardRequest):
             // Auth comes first: an unauthenticated request must not warm, read, or
             // deduplicate against the response cache.
             guard runtime.dashboardAuth.authorize(request) else {
@@ -897,7 +1044,8 @@ extension CodexBarCLI {
             let operationKey: String
             do {
                 snapshot = try Self.loadServeConfigSnapshot(configStore: runtime.configStore)
-                operationKey = try Self.serveOperationKey(kind: "dashboard", provider: nil)
+                _ = try Self.serveProviderSelection(rawProvider: dashboardRequest.provider, config: snapshot.config)
+                operationKey = try Self.serveOperationKey(kind: "dashboard", provider: dashboardRequest.provider)
             } catch {
                 let status: CLIHTTPStatus = error is CLIServeArgumentError ? .badRequest : .internalServerError
                 return Self.addingNoStore(Self.serveError(status: status, message: error.localizedDescription))
@@ -907,7 +1055,8 @@ extension CodexBarCLI {
                     key: operationKey,
                     configFingerprint: snapshot.cacheToken,
                     refreshInterval: runtime.refreshInterval,
-                    deadline: requestDeadline),
+                    deadline: requestDeadline,
+                    forceRefresh: dashboardRequest.forceRefresh),
                 cache: runtime.cache,
                 makeResponse: {
                     await Self.serveDashboardSnapshot(
@@ -927,7 +1076,9 @@ extension CodexBarCLI {
                                 requestDeadline: requestDeadline,
                                 now: { ContinuousClock().now },
                                 providerOperations: runtime.costOperations),
-                            codexBarVersion: runtime.healthVersion))
+                            codexBarVersion: runtime.healthVersion,
+                            provider: dashboardRequest.provider,
+                            forceRefresh: dashboardRequest.forceRefresh))
                 }))
         }
     }
@@ -979,7 +1130,8 @@ extension CodexBarCLI {
                 refreshInterval: refreshInterval,
                 deadline: self.serveRequestDeadline(
                     startedAt: ContinuousClock().now,
-                    requestTimeout: requestTimeout)),
+                    requestTimeout: requestTimeout),
+                forceRefresh: false),
             cache: cache,
             makeResponse: makeResponse)
     }
@@ -992,7 +1144,7 @@ extension CodexBarCLI {
         let cacheKey = Self.serveCacheKey(
             operationKey: request.key,
             configToken: request.configFingerprint)
-        if let response = await cache.cachedResponse(for: cacheKey, now: Date()) {
+        if !request.forceRefresh, let response = await cache.cachedResponse(for: cacheKey, now: Date()) {
             return response
         }
 
@@ -1014,7 +1166,7 @@ extension CodexBarCLI {
                 return CLIServeCoordinatedResponse(response: committed, isCommitted: true)
             },
             operation: {
-                if let response = await cache.cachedResponse(for: cacheKey, now: Date()) {
+                if !request.forceRefresh, let response = await cache.cachedResponse(for: cacheKey, now: Date()) {
                     return CLIServeCoordinatedResponse(response: response, isCommitted: false)
                 }
                 let response = await makeResponse()
@@ -1161,9 +1313,12 @@ extension CodexBarCLI {
     /// in-flight dedup, and config fingerprints all apply unchanged — then
     /// projects the results through `DashboardSnapshotBuilder`.
     private static func serveDashboardSnapshot(context: ServeDashboardContext) async -> CLILocalHTTPResponse {
-        let selection = Self.providerSelection(
-            rawOverride: nil,
-            enabled: context.config.enabledProviders())
+        let selection: ProviderSelection
+        do {
+            selection = try Self.serveProviderSelection(rawProvider: context.provider, config: context.config)
+        } catch {
+            return Self.serveError(status: .badRequest, message: error.localizedDescription)
+        }
 
         let usageOutput: UsageCommandOutput
         do {
@@ -1181,7 +1336,7 @@ extension CodexBarCLI {
             do {
                 let snapshot = try await fetcher.loadTokenSnapshot(
                     provider: provider,
-                    forceRefresh: false,
+                    forceRefresh: context.forceRefresh,
                     refreshPricingInBackground: Self.serveCostRefreshesPricingInBackground)
                 return Self.makeCostPayload(provider: provider, snapshot: snapshot, error: nil)
             } catch {
